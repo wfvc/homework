@@ -233,6 +233,9 @@
   .vbar{height:6px;background:var(--pend-bg);border-radius:99px;overflow:hidden;margin-top:4px;min-width:70px}
   .vbar i{display:block;height:100%;background:var(--ok)}
   .rev-item{border:1px solid var(--line);border-left:3px solid var(--miss);border-radius:10px;padding:8px 10px;margin-top:8px;font-size:14px}
+  .danger-zone{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+  .danger-zone>div{flex:1;min-width:220px}
+  .danger-zone p{margin:4px 0 0}
   @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style>
 </head>
@@ -451,6 +454,24 @@ async function makeFirebaseApi() {
     async listStudents(cid) { return rows(await F.getDocs(F.query(F.collection(db, "users"), F.where("classIds", "array-contains", cid)))).map(u => ({ ...u, uid: u.id })).filter(u => !isTeacherEmail(u.email)).sort((a, b) => a.name.localeCompare(b.name)); },
     removeStudent: (cid, uid) => F.updateDoc(F.doc(db, "users", uid), { classIds: F.arrayRemove(cid) }),
     setFinalOpen: (cid, on) => F.updateDoc(F.doc(db, "classes", cid), { finalOpen: !!on }),
+    async deleteClass(cls, onStep) {
+      const by = (col, field) => F.getDocs(F.query(F.collection(db, col), F.where(field, "==", cls.id)));
+      // 1. the code stops working, so nobody can join while the class is being deleted
+      if (cls.code) await F.deleteDoc(F.doc(db, "joinCodes", cls.code));
+      // 2. uploaded photos and files
+      const fl = await by("files", "classId"); let i = 0;
+      for (const d of fl.docs) { await deleteFileDoc(d.id, d.data().chunkCount); delete urlCache[d.id]; onStep?.(`Deleting files ${++i}/${fl.size}…`); }
+      // 3. submissions and homework
+      for (const d of (await by("submissions", "classId")).docs) await F.deleteDoc(d.ref);
+      onStep?.("Deleting homework…");
+      for (const d of (await by("assignments", "classId")).docs) await F.deleteDoc(d.ref);
+      // 4. take the class off every student's list
+      onStep?.("Removing students…");
+      const us = await F.getDocs(F.query(F.collection(db, "users"), F.where("classIds", "array-contains", cls.id)));
+      for (const d of us.docs) await F.updateDoc(d.ref, { classIds: F.arrayRemove(cls.id) });
+      // 5. the class itself
+      await F.deleteDoc(F.doc(db, "classes", cls.id));
+    },
     // assignments
     async listAssignments(cid) { return rows(await F.getDocs(F.query(F.collection(db, "assignments"), F.where("classId", "==", cid)))).map(normA).sort((a, b) => a.deadline - b.deadline); },
     createAssignment: a => F.addDoc(F.collection(db, "assignments"), { classId: a.classId, title: a.title, description: a.description || "", deadline: F.Timestamp.fromMillis(a.deadline), createdAt: F.serverTimestamp() }),
@@ -592,6 +613,13 @@ function makeDemoApi() {
     async joinClass(code) { const c = db.classes.find(x => x.code === code.trim().toUpperCase()); if (!c) throw new Error("That class code doesn't exist. Check it with your teacher."); if (!current.classIds.includes(c.id)) current.classIds.push(c.id); return c.id; },
     listStudents: cid => wait(db.users.filter(u => u.classIds.includes(cid) && !isTeacherEmail(u.email)).sort((a, b) => a.name.localeCompare(b.name))),
     async setFinalOpen(cid, on) { const c = db.classes.find(x => x.id === cid); if (c) c.finalOpen = !!on; },
+    async deleteClass(cls) {
+      const aids = db.assignments.filter(a => a.classId === cls.id).map(a => a.id);
+      db.submissions = db.submissions.filter(x => !aids.includes(x.assignmentId));
+      db.assignments = db.assignments.filter(a => a.classId !== cls.id);
+      db.users.forEach(u => u.classIds = u.classIds.filter(x => x !== cls.id));
+      db.classes = db.classes.filter(c => c.id !== cls.id);
+    },
     async removeStudent(cid, uid) { const u = db.users.find(x => x.uid === uid); u.classIds = u.classIds.filter(x => x !== cid); },
     listAssignments: cid => wait(db.assignments.filter(a => a.classId === cid).sort((a, b) => a.deadline - b.deadline)),
     async createAssignment(a) { db.assignments.push({ id: "a" + Date.now(), ...a }); },
@@ -1239,12 +1267,47 @@ function tabStudents() {
       return `<div class="list-item"><div><b>${esc(s.name)}</b><div class="small muted">${esc(s.email)}</div>
         <div class="row small" style="gap:6px;margin-top:4px"><span class="badge s-ontime">${c.ontime} on time</span><span class="badge s-late">${c.late} late</span><span class="badge s-missing">${c.missing} missing</span><span class="badge" style="background:var(--brand-soft);color:var(--brand)">📝 ${T.vocab.filter(v => v.studentId === s.uid && v.rec.total / (v.rec.max || 20) >= VOCAB_OK).length} vocab ✓</span></div></div>
         <button class="btn sm danger" data-rm="${s.uid}">Remove</button></div>`; }).join("") : `<p class="muted">No students yet.</p>`}
+  </div>
+  <div class="card danger-zone">
+    <div><b>Delete this class</b>
+      <p class="small muted">Deletes the class, its code, all its homework and every uploaded photo and file. Students are taken off the class but keep their accounts and vocabulary results. This cannot be undone.</p></div>
+    <button class="btn danger" id="delClass">Delete class</button>
   </div>`;
+  $("#delClass").onclick = () => confirmDeleteClass(cls, students.length, assignments.length);
   $("#tabBody").querySelectorAll("[data-rm]").forEach(b => b.onclick = async () => {
     if (!await askConfirm("Remove this student from the class?", "Remove")) return;
     const done = busy(b, "Removing…");
     try { await api.removeStudent(cls.id, b.dataset.rm); toast("Student removed"); await renderTeacher(); } catch (e) { done(); toast(niceError(e)); }
   });
+}
+
+function confirmDeleteClass(cls, nStudents, nHomework) {
+  const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const m = modal(`<h2>Delete “${esc(cls.name)}”?</h2>
+    <p>This deletes <b>${plural(nHomework, "homework")}</b> with all uploaded photos and files, and takes <b>${plural(nStudents, "student")}</b> off this class.
+    Their accounts and vocabulary results stay. <b>This cannot be undone.</b></p>
+    <label for="delName">To confirm, type the class name: <b>${esc(cls.name)}</b></label>
+    <input type="text" id="delName" autocomplete="off" autocapitalize="none" spellcheck="false">
+    <div class="err" id="delErr"></div>
+    <div class="row" style="justify-content:flex-end"><button class="btn" data-close>Cancel</button>
+      <button class="btn primary" id="delGo" disabled style="background:var(--miss);border-color:var(--miss);color:#fff">Delete class</button></div>`);
+  const inp = m.querySelector("#delName"), go = m.querySelector("#delGo");
+  const same = () => inp.value.trim().toLowerCase() === cls.name.trim().toLowerCase();
+  inp.oninput = () => { go.disabled = !same(); };
+  setTimeout(() => inp.focus(), 50);
+  go.onclick = async () => {
+    if (!same()) return;
+    m.querySelectorAll("[data-close]").forEach(b => b.disabled = true); inp.disabled = true;
+    const done = busy(go, "Deleting…");
+    try {
+      await api.deleteClass(cls, t => { if (go.isConnected) go.innerHTML = `<span class="spin"></span>${esc(t)}`; });
+      m.remove(); state.classId = null; state.tab = "overview"; T = {};
+      toast(`“${cls.name}” deleted`); await renderTeacher();
+    } catch (e) {
+      done(); inp.disabled = false; m.querySelectorAll("[data-close]").forEach(b => b.disabled = false);
+      m.querySelector("#delErr").textContent = "Could not finish: " + niceError(e) + ". Tap Delete class again to continue.";
+    }
+  };
 }
 
 function renderNewClass(first) {
